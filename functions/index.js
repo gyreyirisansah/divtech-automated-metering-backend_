@@ -2,116 +2,29 @@ const functions = require("firebase-functions");
 const admin = require("firebase-admin");
 admin.initializeApp();
 const rdb = admin.database();
-//const { rdb } = require("./util/admin");
 
-/*const { db } = require("./util/admin");
-const { getAllComplains, createComplain } = require("./model/complain");
-const {
-  createConsumer,
-  getAllConsumers,
-  getAllMeters,
-  getMeterById,
-  getBlackout,
-  getConsumerByMeterId,
-  getMeterReadingsByMeterId,
-  getAllPayments,
-  getPaymentById,
-  createPayment
-} = require("./model/consumer");
+var months = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
 
-const { createUser, singin, getUser } = require("./model/users");
-const fbAuth = require("./util/fbAuth");
-const app = require("express")();
-const cors = require("cors");
-
-//firebase.initializeApp(config);
-app.use(cors({ origin: true }));
-app.get("/complains", getAllComplains);
-app.post("/complains", createComplain);
-
-app.post("/consumer", createConsumer);
-app.get("/consumer", getAllConsumers);
-app.get("/consumer/:meterId", getConsumerByMeterId);
-
-app.get("/meters", getAllMeters);
-app.get("/meters/blackout", getBlackout);
-app.get("/meters/:meterId", getMeterById);
-app.get("/meters/meterreadings/:meterId", getMeterReadingsByMeterId);
-
-app.get("/users", getUser);
-app.post("/users", createUser);
-app.post("/users/login", singin);
-
-app.get("/payments", getAllPayments);
-app.get("/payments/:meterId", getPaymentById);
-app.post("/payments", createPayment);
-
-exports.api = functions.region("europe-west1").https.onRequest(app);
-*/
-// exports.createNotificationOnComplain = functions
-//   .region("europe-west1")
-//   .firestore.document("complains/{id}")
-//   .onCreate(snapshot => {
-//     db.doc(`/complains/${snapshot.id}`)
-//       .get()
-//       .then(doc => {
-//         if (doc.exists) {
-//           return db.doc(`notifications/${snapshot.id}`).set({
-//             createdAt: snapshot.data().createdAt,
-//             meterId: snapshot.data().meterId,
-//             complain: snapshot.data().complain,
-//             read: false,
-//             type: "complain"
-//           });
-//         }
-//       })
-//       .then(() => {
-//         return;
-//       })
-//       .catch(err => {
-//         console.error(err);
-//         return;
-//       });
-//   });
-
-/*exports.onConsumption = functions.database
-  .ref("/meters/{meterId}/energy")
-  .onWrite((change, context) => {
-    var startTime;
-    var mode
-    var bill = 1;
-    if (!change.before.exists()) {
-      startTime = Date.now();
-    }
-    change.after.ref.parent.child("mode").once("value",(data) =>{
-      if(data.val() !=null){
-        mode = data.val()
-      }
-    })
-    const curr = change.after.val();
-    //const elapseTime = Date.now() - startTime;
-    //const elapseTimeInHours = elapseTime / 3600;
-    //const tarrifCategory = curr / elapseTimeInHours;
-
-    if(mode == "Prepaid"){
-
-
-    }else if(mode == "Postpaid"){
-
-      if (curr < 51) {
-        bill = 0.30778 * curr;
-      } else if ((curr == 51 || curr > 51) && cu < 301) {
-        bill = 0.617488 * curr;
-      } else if ((curr == 301 || curr > 301) && curr < 601) {
-        bill = 0.80138 * curr;
-      } else if (curr > 601) {
-        bill = 0.890422;
-      }
-      return change.after.ref.parent.child("bill").set(bill.toFixed(2));
-
-    }
-  });
-*/
+function monthNumToName(monthnum) {
+  return months[monthnum - 1] || "";
+}
+function monthNameToNum(monthname) {
+  var month = months.indexOf(monthname);
+  return month ? month + 1 : 0;
+}
 
 const calculatebill = (energy) => {
   var bill;
@@ -316,6 +229,93 @@ exports.onMeterReconnection = functions.database
 
             return admin.messaging().sendToDevice(notificationToken, payload);
           });
+      }
+    }
+  });
+
+exports.onPayment = functions.database
+  .ref("/payments/{paymentId}")
+  .onWrite((change, context) => {
+    var paymentDetails = change.after.val();
+    var amountPaid = paymentDetails.amountPaid;
+    var meterId = paymentDetails.meterId;
+    var meterDetails;
+    var notificationToken;
+
+    rdb.ref(`meters/${meterId}`).once("value", (data) => {
+      meterDetails = data.val();
+    });
+
+    rdb.ref(`consumers/${meterId}/notificationToken`).once("value", (data) => {
+      notificationToken = data.val();
+    });
+
+    if (meterDetails.mode == "Prepaid") {
+      var balance = meterDetails.balance;
+      energyBought = prepaidUnitsConversion(amountPaid);
+      balance = balance + energyBought;
+      return rdb
+        .ref(`meters/${meterId}/balance`)
+        .set(balance)
+        .then((data) => {
+          const payload = {
+            notification: {
+              title: "Balance Recharge",
+              body: `You have successfully recharged ${energyBought} kW/h for meter ${meterId}. Your currnet balance is ${balance}.`,
+            },
+          };
+          admin.messaging().sendToDevice(notificationToken, payload);
+        });
+    } else if (meterDetails.mode == "Postpaid") {
+      curDate = new Date();
+      const currentMonth = monthNumToName(curDate.getMonth() + 1);
+      const previousMonth = monthNumToName(curDate.getMonth());
+      const currentYear = Date.getFullYear();
+      var previousMonthDetails;
+      rdb
+        .ref(`readingStats/${meterId}/${currentYear}/${previousMonth}`)
+        .once("value", (data) => {
+          previousMonthDetails = data.val();
+        });
+
+      if (previousMonthDetails.bill - previousMonthDetails.amountPaid > 0) {
+        if (
+          previousMonthDetails.bill - amountPaid > 0 ||
+          previousMonthDetails.bill - amountPaid == 0
+        ) {
+          rdb
+            .ref(`readingStats/${meterId}/${currentYear}/${previousMonth}`)
+            .amountPaid.set(amountPaid)
+            .then(() => {
+              const payload = {
+                notification: {
+                  title: "Bill Payment",
+                  body: `You have successfully paid ${amountPaid} GHS for meter ${meterId} for the  month of  ${previousMonth}.`,
+                },
+              };
+              return admin.messaging().sendToDevice(notificationToken, payload);
+            });
+        } else {
+          var previousMonthBill = previousMonthDetails.bill;
+          var currentMonthBillPaid = amountPaid - amountPaid;
+          return rdb
+            .ref(`readingStats/${meterId}/${currentYear}/${previousMonth}`)
+            .amountPaid.set(previousMonthBill)
+            .then(() => {
+              rdb
+                .ref(`readingStats/${meterId}/${currentYear}/${currentMonth}`)
+                .amountPaid.set(currentMonthBillPaid);
+            })
+            .then(() => {
+              const payload = {
+                notification: {
+                  title: "Bill Payment",
+                  body: `You have successfully paid ${previousMonthBill} GHS for the  month of  ${previousMonth} and  ${currentMonthBillPaid} GHS for the  month of  ${currentMonth} for meter ${meterId}.`,
+                },
+              };
+              return admin.messaging().sendToDevice(notificationToken, payload);
+            });
+        }
       }
     }
   });
