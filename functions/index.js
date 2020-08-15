@@ -3,6 +3,10 @@ const admin = require("firebase-admin");
 admin.initializeApp();
 const rdb = admin.database();
 
+const promisePool = require('es6-promise-pool');
+const PromisePool = promisePool.PromisePool;
+const MAX_CONCURRENT = 3;
+
 /* Array of Months to use in months conversion functions */
 var months = [
   "January",
@@ -20,9 +24,12 @@ var months = [
 ];
 
 curDate = new Date();
+const nextMonth = monthNumToName(curDate.getMonth() + 2);
 const currentMonth = monthNumToName(curDate.getMonth() + 1);
 const previousMonth = monthNumToName(curDate.getMonth());
 const currentYear = Date.getFullYear();
+var lastDate = new Date(curDate.getFullYear() + 1, curDate.getMonth(), 0);
+var lastDayofMonth = lastDate.getDate();
 
 var balanceLessThan10Notififciation = true;
 var balanceLessThan5Notififciation = true;
@@ -501,7 +508,9 @@ exports.onPayment = functions.database
           /*Set amount paid at previous month and current month*/
           return rdb
             .ref(`readingStats/${meterId}/${currentYear}/${previousMonth}`)
-            .amountPaid.set(previousMonthBillLeft)
+            .amountPaid.set(
+              previousMonthBillLeft + previousMonthDetails.amountPaid
+            )
             .then(() => {
               return rdb
                 .ref(`readingStats/${meterId}/${currentYear}/${currentMonth}`)
@@ -654,6 +663,114 @@ const calculateAwardedPoints = (
   }
 };
 
+/*Function run on every first day of the month at 00:00 on the firstday of the month*/
+exports.processNextMonthDatabase = functions.pubsub
+  .schedule(`23 50 ${lastDayofMonth} * *`)
+  .timeZone("Africa/Accra")
+  .onRun(async (context) => {
+    /*Get all postpaid meter users*/
+    const meters = await getListofPostPaidMeterIds();
+
+    /*Create new current month reading details*/
+    const promisePool = new PromisePool(
+      () => createNewMonthReadingStats(meters),
+      MAX_CONCURRENT
+    );
+    await promisePool.start();
+    console.log("Next Month Database is set successfully");
+  });
+
+/*Retrieve all postpaid meters*/
+const getListofPostPaidMeterIds = () => {
+  var meterList = [];
+
+  rdb
+    .ref("meters")
+    .orderByChild("mode")
+    .equalTo("Postpaid")
+    .once("value", (data) => {
+      // var meters = data.val()
+      if (data.val() != null) {
+        data.forEach((meter) => {
+          meterList.push(meter.key);
+        });
+      }
+    });
+
+  return meterList;
+};
+
+/**Set database for next month meter readings */
+const createNewMonthReadingStats = (meterlist) => {
+  const readingStatData = {
+    amountPaid: 0,
+    energy: 0,
+    bill: 0,
+  };
+  if (meterlist.length > 0) {
+    meterlist.forEach((meter) => {
+      rdb
+        .ref(`readingStats/${meter}/${currentYear}/${nextMonth}`)
+        .set(readingStatData);
+    });
+    return console.log(`${nextMonth} data created succesfully`);
+  }
+  return console.log(`${nextMonth} could not be created`);
+};
+
+/* Send notification to user to inform user on bill */
+const sendNotificationToConsumersOnBill = (notificationToken, bill, amountpaid) =>{
+  let balance = bill - amountpaid
+    const payload ={
+      notification: {
+        title: "Monthly Bill",
+        body: `Your monthly bill for ${previousMonth} is ${bill}, amount paid is ${amountpaid}, amount payable is ${balance}. Kindly pay before 7th of ${currentMonthDetails}`
+      }
+    }
+    return admin.messaging().sendToDevice(notificationToken,payload) 
+}
+
+/** If Amount paid for previous amount exceeds current month, then set current month's amount paid with ballance */
+const checkIfAmountPaidExceedsPreviousMonthBill = (meterId, bill, amountpaid) =>{
+  let balance = bill - amountpaid
+  if (balance <0){
+    return rdb.ref(`readingStats/${meterId}/${currentYear}/${currentMonth}/amountPaid`).set(Math.abs(balance))
+  }
+  return
+}
+
+/* get previous month meter reading of a meter */
+const getPreviousMonthReadingStats = (meterId) =>{
+  var readingStats
+  rdb.ref(`readingStats/${meterId}/${currentYear}/${currentMonth}/`).once("value", snapshot =>{
+    readingStats = snapshot.val()
+  })
+  return readingStats
+}
+
+/** Retrieve notification token */
+const getNotificationToken = (meterId) => {
+  var notificationToken
+  rdb.ref(`consumers/${meterId}/notificationToken`).once("value", snapshot => {
+    notificationToken = snapshot.val()
+  })
+  return notificationToken
+}
+
+
+/**Process Bill to process */
+const processBill = async (meterlist) =>{
+  if(meterlist.length >0){
+    meterlist.forEach(meterId => {
+      var previousMonthReadingStats = await getPreviousMonthReadingStats(meterId)
+      var notificationToken = await getNotificationToken(meterId)
+      await checkIfAmountPaidExceedsPreviousMonthBill(meterId, previousMonthReadingStats.bill ,previousMonthReadingStats.amountPaid)
+      await sendNotificationToConsumersOnBill(notificationToken,previousMonthReadingStats.bill, previousMonthReadingStats.amountPaid )
+    });
+  }else{
+    return console.log("Bill could not be processed")
+  }
+}
 // exports.onBilling = functions.database
 //   .ref("/meters/{meterId}/bill")
 //   .onWrite((change, context) => {
